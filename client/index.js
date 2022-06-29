@@ -48,13 +48,17 @@ function randomAttack() {
     const sock = io("http://localhost:3070", {
         reconnection: true,
     });
-    for (let index = 0; index < 25000; index++) {
+
+    let timeout = Math.floor(Math.random() * (15000 - 1500)) + 1500;
+    timeout = 10;
+
+    for (let index = 0; index < 4000; index++) {
         setTimeout(() => {
             try {
                 const emited = sock.emit('query', {
-                    key: 'auto_test_' + index,
+                    key: 'key' + (Math.floor(Math.random() * (10 - 1)) + 1).toString(),
                     type: 'add',
-                    payload: Math.random().toString()
+                    payload: 'auto_test_' + index,
                 })
                 emited.onerror = (e) => {
                     console.error(e)
@@ -68,7 +72,7 @@ function randomAttack() {
                 console.error(e);
                 throw e;
             }
-        }, Math.floor(Math.random() * (15000 - 1500)) + 1500);
+        }, timeout);
     }
 }
 

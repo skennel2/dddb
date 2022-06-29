@@ -1,18 +1,15 @@
 import fs from 'fs';
-import readline from 'readline'
 import { v4 as uuidv4 } from 'uuid';
-import express, { Response, Request } from 'express';
-import http, { Server } from 'http';
+import express from 'express';
+import http from 'http';
 import * as io from 'socket.io';
 import { DefaultEventsMap } from 'socket.io/dist/typed-events';
-import { Http2ServerRequest } from 'http2';
-import { rejects } from 'assert/strict';
-import { version } from 'os';
 
 class DdDbServer implements IDdDbServer {
 
     private ioServer: io.Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any> | null = null;
     private httpServer: http.Server | null = null;
+
     private connectionLog: {
         clientId: string,
         created: Date;
@@ -21,10 +18,14 @@ class DdDbServer implements IDdDbServer {
 
     private queryLogQueue: IDataLogRecord[] = [];
     private subQueryLogQueue: IDataLogRecord[] = [];
+
     private dataFlushing: boolean = false;
+
+    private logFileMaxVersion = 0;
+    private activeLogFileName: string | null = null;
+
     private readonly LOG_ROOT_PATH = 'log/';
     private readonly LOG_FILE_BASE_NAME = 'datalog';
-    private fileMaxVersion = 0;
 
     constructor() {
         let app = express();
@@ -32,8 +33,6 @@ class DdDbServer implements IDdDbServer {
 
         this.ioServer = new io.Server(this.httpServer);
     }
-
-
 
     start = (setup: IConnectSetup) => {
         this.setUp(setup).then(() => {
@@ -62,12 +61,12 @@ class DdDbServer implements IDdDbServer {
                     }).map(versionNumber => {
                         return Number(versionNumber);
                     })
-                
+
                 const maxVersion = versions.reduce((version1, version2) => {
                     return version1 > version2 ? version1 : version2
                 }, 0);
 
-                this.fileMaxVersion = maxVersion;
+                this.logFileMaxVersion = maxVersion;
 
                 resolve();
             })
@@ -83,6 +82,11 @@ class DdDbServer implements IDdDbServer {
         setInterval(async () => {
             await this.flush();
         }, setup.flushInterval !== undefined ? setup.flushInterval : 5000)
+
+        setInterval(async () => {
+            this.compactLogFile()
+        }, 50000)
+
 
         this.httpServer.listen(setup.port, () => {
             this.log('listen ' + setup.port)
@@ -101,7 +105,7 @@ class DdDbServer implements IDdDbServer {
                 this.log('request -> ' + args)
                 try {
                     const argsObject = this.parseClientQueryRequestArgument(args);
-                    if (argsObject) {
+                    if (argsObject && argsObject.key) {
                         if (argsObject.type === 'add') {
                             if (this.dataFlushing === false) {
                                 this.queryLogQueue.push({
@@ -166,20 +170,82 @@ class DdDbServer implements IDdDbServer {
                 return dataString1 + dataString2;
             }, '');
 
-        let filePath = this.LOG_ROOT_PATH + fileBaseName + this.fileMaxVersion + '.log';
+        let filePath = this.LOG_ROOT_PATH + fileBaseName + this.logFileMaxVersion + '.log';
+
         const isFileExists = await this.isFileExists(filePath);
 
         if (isFileExists) {
             const fileSize = await this.getFileSize(filePath);
             if (fileSize >= 4000) {
-                filePath = this.LOG_ROOT_PATH + fileBaseName + ++this.fileMaxVersion + '.log';
+                filePath = this.LOG_ROOT_PATH + fileBaseName + ++this.logFileMaxVersion + '.log';
+                this.activeLogFileName = filePath.replace('this.LOG_ROOT_PATH', '');
                 await this.writeFile(filePath, result);
             } else {
+                this.activeLogFileName = filePath.replace('this.LOG_ROOT_PATH', '');
                 await this.appendFile(filePath, result);
             }
         } else {
+            this.activeLogFileName = filePath.replace('this.LOG_ROOT_PATH', '');
             await this.writeFile(filePath, result);
         }
+    }
+
+    private compactLogFile() {
+        if (this.dataFlushing === true) {
+            return Promise.resolve();
+        }
+
+        return new Promise<void>((resolveMain, rejectMain) => {
+            fs.readdir(this.LOG_ROOT_PATH, (error, fileNames) => {
+                if (error) {
+                    rejectMain(error);
+                    return;
+                }
+
+                const targetFileNames = fileNames.filter(fileName => true);
+
+                Promise.all<{ fileName: string, data: string }>(targetFileNames.map((fileName) => {
+                    return new Promise(resolve => {
+                        this.readFile(this.LOG_ROOT_PATH + fileName).then(fileData => {
+                            resolve({
+                                fileName: fileName,
+                                data: fileData
+                            })
+                        })
+                    })
+                })).then(fileDataWithNameArray => {
+                    fileDataWithNameArray
+                        .filter(data => data.fileName !== this.activeLogFileName)
+                        .forEach(fileDataWithName => {
+                            const lines = fileDataWithName.data
+                                .split('\n')
+                                .filter(line => line.length > 0)
+                                .map(line => {
+                                    return JSON.parse(line)
+                                });
+
+                            const mm = new Map<string, object>();
+
+                            lines.forEach(line => {
+                                if (mm.has(line.key)) {
+                                    mm.delete(line.key);
+                                }
+
+                                mm.set(line.key, line);
+                            })
+
+                            console.log(mm)
+
+                            const sortedByKey = Array.from(mm.values()).sort((a, b) => {
+                                return (a < b ? -1 : (a > b ? 1 : 0));
+                            });
+
+                            this.writeFile(this.LOG_ROOT_PATH + 'test' + fileDataWithName.fileName, sortedByKey.map(item => JSON.stringify(item)).join('\n'))
+                        })
+                })
+
+            });
+        })
     }
 
     private writeFile = (filePath: string, data: any) => {
@@ -202,6 +268,18 @@ class DdDbServer implements IDdDbServer {
                     return;
                 }
                 resolve();
+            })
+        })
+    }
+
+    private readFile = (filePath: string) => {
+        return new Promise<string>((resolve, reject) => {
+            fs.readFile(filePath, 'utf-8', (error, data) => {
+                if (error) {
+                    reject(error);
+                    return;
+                }
+                resolve(data);
             })
         })
     }
