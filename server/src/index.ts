@@ -22,7 +22,8 @@ class DdDbServer implements IDdDbServer {
     private queryLogQueue: IDataLogRecord[] = [];
     private subQueryLogQueue: IDataLogRecord[] = [];
     private dataFlushing: boolean = false;
-    private readonly LOG_ROOT_PATH = 'log/'
+    private readonly LOG_ROOT_PATH = 'log/';
+    private readonly LOG_FILE_BASE_NAME = 'datalog';
     private fileMaxVersion = 0;
 
     constructor() {
@@ -55,9 +56,9 @@ class DdDbServer implements IDdDbServer {
 
                 const versions = fileNames
                     .filter(fileName => {
-                        return fileName.startsWith('datalog') && fileName.endsWith('.log');
+                        return fileName.startsWith(this.LOG_FILE_BASE_NAME) && fileName.endsWith('.log');
                     }).map((fileName) => {
-                        return fileName.replace('datalog', '').replace('.log', '');
+                        return fileName.replace(this.LOG_FILE_BASE_NAME, '').replace('.log', '');
                     }).map(versionNumber => {
                         return Number(versionNumber);
                     })
@@ -150,7 +151,7 @@ class DdDbServer implements IDdDbServer {
 
         this.dataFlushing = true;
 
-        await this.writeLogDataToFile('datalog', this.queryLogQueue);
+        await this.writeLogDataToFile(this.LOG_FILE_BASE_NAME, this.queryLogQueue);
 
         this.dataFlushing = false;
 
