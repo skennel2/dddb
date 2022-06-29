@@ -6,79 +6,24 @@ import http, { Server } from 'http';
 import * as io from 'socket.io';
 import { DefaultEventsMap } from 'socket.io/dist/typed-events';
 import { Http2ServerRequest } from 'http2';
-
-class TestClient {
-    // runTest22() {
-    //     for (let index = 0; index < 50000; index++) {
-    //         const value = JSON.stringify({
-    //             value: Math.random().toString()
-    //         })
-
-    //         const data = {
-    //             job: uuidv4(),
-    //             key: 'key' + index.toString(),
-    //             value: value,
-    //             created: new Date()
-    //         }
-    //         this.appendData(data)
-    //     }
-    // }
-
-    // appendData(data: any) {
-    //     return new Promise<void>((rslv, rjt) => {
-    //         setTimeout(() => {
-    //             fs.appendFile('log/file.log', JSON.stringify(data) + '\n', (error) => {
-    //                 if (error) {
-    //                     rjt(error)
-    //                     return;
-    //                 }
-
-    //                 rslv();
-    //             })
-    //         }, 2);
-    //     })
-    // }
-
-    // runTest2() {
-    //     fs.readFile('log/file.log', {
-    //         encoding: 'utf8'
-    //     }, (error, data) => {
-    //         console.log(data);
-    //     });
-    // }
-
-    // runTest33() {
-    //     let app = express();
-    //     let httpServer = http.createServer(app);
-    //     let ioServer = new io.Server(httpServer);
-
-    //     ioServer.on('connection', (socket) => {
-    //         console.log('a user connected');
-
-    //         socket.emit('hello', {
-    //             value: 'hello'
-    //         })
-    //     });
-
-    //     httpServer.listen(3070, () => {
-    //         console.log('listen 3070')
-    //     })
-    // }
-
-    runTest() {
-        new DdDbServer().start({
-            port: 3070,
-            host: 'my server',
-            name: 'admin',
-            password: 'aaaa'
-        })
-    }
-}
+import { rejects } from 'assert/strict';
+import { version } from 'os';
 
 class DdDbServer implements IDdDbServer {
 
     private ioServer: io.Server<DefaultEventsMap, DefaultEventsMap, DefaultEventsMap, any> | null = null;
     private httpServer: http.Server | null = null;
+    private connectionLog: {
+        clientId: string,
+        created: Date;
+        type: 'connected' | 'disconnected'
+    }[] = [];
+
+    private queryLogQueue: IDataLogRecord[] = [];
+    private subQueryLogQueue: IDataLogRecord[] = [];
+    private dataFlushing: boolean = false;
+    private readonly LOG_ROOT_PATH = 'log/'
+    private fileMaxVersion = 0;
 
     constructor() {
         let app = express();
@@ -87,43 +32,11 @@ class DdDbServer implements IDdDbServer {
         this.ioServer = new io.Server(this.httpServer);
     }
 
-    makeDataBase = (name: string,) => {
 
-    }
 
     start = (setup: IConnectSetup) => {
-        if (!this.httpServer || !this.ioServer) {
-            throw new Error('HTTP Server Cannot Started');
-        }
-
-        this.httpServer.listen(setup.port, () => {
-            this.log('listen ' + setup.port)
-        })
-
-        this.ioServer.on('connection', (socket) => {
-            this.log('new client connected', socket.id);
-
-            socket.on('query', (args) => {
-                const argsObject = this.parseClientQueryRequestArgument(args);
-                if (argsObject) {
-                    if (argsObject.type === 'add') {
-                        this.addData({
-                            id: uuidv4(),
-                            status: 'add',
-                            key: argsObject.key,
-                            value: argsObject.payload,
-                            created: new Date(),
-                            clientId: socket.id,
-                            accountId: setup.name
-                        })
-                    }
-                }
-            })
-
-            socket.on('close', () => {
-                this.log('nclient close', socket.id);
-            })
-
+        this.setUp(setup).then(() => {
+            this.processStart(setup)
         })
 
         return {
@@ -133,16 +46,186 @@ class DdDbServer implements IDdDbServer {
         }
     }
 
-    addData = (data: IDataLogRecord) => {
-        return new Promise<void>((rslv, rjt) => {
-            fs.appendFile('log/file.log', JSON.stringify(data) + '\n', (error) => {
+    private setUp = (setup: IConnectSetup) => {
+        return new Promise<void>((resolve, reject) => {
+            fs.readdir(this.LOG_ROOT_PATH, (error, fileNames) => {
                 if (error) {
-                    rjt(error);
-                    return;
+                    reject();
                 }
 
-                rslv();
+                const versions = fileNames
+                    .filter(fileName => {
+                        return fileName.startsWith('datalog') && fileName.endsWith('.log');
+                    }).map((fileName) => {
+                        return fileName.replace('datalog', '').replace('.log', '');
+                    }).map(versionNumber => {
+                        return Number(versionNumber);
+                    })
+                
+                const maxVersion = versions.reduce((version1, version2) => {
+                    return version1 > version2 ? version1 : version2
+                }, 0);
+
+                this.fileMaxVersion = maxVersion;
+
+                resolve();
             })
+        })
+
+    }
+
+    private processStart = (setup: IConnectSetup) => {
+        if (!this.httpServer || !this.ioServer) {
+            throw new Error('HTTP Server Cannot Started');
+        }
+
+        setInterval(async () => {
+            await this.flush();
+        }, setup.flushInterval !== undefined ? setup.flushInterval : 5000)
+
+        this.httpServer.listen(setup.port, () => {
+            this.log('listen ' + setup.port)
+        })
+
+        this.ioServer.on('connection', (socket) => {
+            this.log('new client connected', socket.id);
+
+            this.connectionLog.push({
+                clientId: socket.id,
+                created: new Date(),
+                type: "connected"
+            })
+
+            socket.on('query', (args) => {
+                this.log('request -> ' + args)
+                try {
+                    const argsObject = this.parseClientQueryRequestArgument(args);
+                    if (argsObject) {
+                        if (argsObject.type === 'add') {
+                            if (this.dataFlushing === false) {
+                                this.queryLogQueue.push({
+                                    id: uuidv4(),
+                                    status: 'add',
+                                    key: argsObject.key,
+                                    value: argsObject.payload,
+                                    created: new Date(),
+                                    clientId: socket.id,
+                                    accountId: setup.name
+                                })
+                            } else {
+                                this.subQueryLogQueue.push({
+                                    id: uuidv4(),
+                                    status: 'add',
+                                    key: argsObject.key,
+                                    value: argsObject.payload,
+                                    created: new Date(),
+                                    clientId: socket.id,
+                                    accountId: setup.name
+                                })
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.error(e);
+                    throw e;
+                }
+            })
+
+            socket.on('disconnect', () => {
+                this.log('client disconnected', socket.id);
+
+                this.connectionLog.push({
+                    clientId: socket.id,
+                    created: new Date(),
+                    type: "disconnected"
+                })
+            })
+        })
+    }
+
+    flush = async () => {
+        if (this.dataFlushing === true) {
+            return;
+        }
+
+        this.dataFlushing = true;
+
+        await this.writeLogDataToFile('datalog', this.queryLogQueue);
+
+        this.dataFlushing = false;
+
+        this.queryLogQueue = [...this.subQueryLogQueue];
+        this.subQueryLogQueue = [];
+    }
+
+    private writeLogDataToFile = async (fileBaseName: string, datas: IDataLogRecord[]) => {
+        let result = datas
+            .map(data => JSON.stringify(data) + '\n')
+            .reduce((dataString1, dataString2) => {
+                return dataString1 + dataString2;
+            }, '');
+
+        let filePath = this.LOG_ROOT_PATH + fileBaseName + this.fileMaxVersion + '.log';
+        const isFileExists = await this.isFileExists(filePath);
+
+        if (isFileExists) {
+            const fileSize = await this.getFileSize(filePath);
+            if (fileSize >= 4000) {
+                filePath = this.LOG_ROOT_PATH + fileBaseName + ++this.fileMaxVersion + '.log';
+                await this.writeFile(filePath, result);
+            } else {
+                await this.appendFile(filePath, result);
+            }
+        } else {
+            await this.writeFile(filePath, result);
+        }
+    }
+
+    private writeFile = (filePath: string, data: any) => {
+        return new Promise<void>((resolve, reject) => {
+            fs.writeFile(filePath, data, (error) => {
+                if (error) {
+                    reject(error);
+                    return;
+                }
+                resolve();
+            })
+        })
+    }
+
+    private appendFile = (filePath: string, data: any) => {
+        return new Promise<void>((resolve, reject) => {
+            fs.appendFile(filePath, data, (error) => {
+                if (error) {
+                    reject(error);
+                    return;
+                }
+                resolve();
+            })
+        })
+    }
+
+    private getFileSize = (filePath: string) => {
+        return new Promise<number>((resolve, reject) => {
+            fs.stat(filePath, (error, fileStat) => {
+                if (error) {
+                    reject(error);
+                    return;
+                }
+                resolve(fileStat.size);
+            })
+        })
+    }
+
+    private isFileExists = (filePath: string) => {
+        return new Promise<boolean>((resolve, reject) => {
+            try {
+                fs.exists(filePath, (exist) => {
+                    resolve(exist);
+                })
+            } catch {
+                reject()
+            }
         })
     }
 
@@ -169,15 +252,14 @@ class DdDbServer implements IDdDbServer {
 
 }
 
-new TestClient().runTest();
-
 // common
 
 interface IConnectSetup {
     host: string,
     port: number,
     name: string,
-    password: string
+    password: string,
+    flushInterval?: number,
 }
 
 interface IClient {
@@ -235,6 +317,19 @@ enum ServerStatus {
     RUNNING, STOP
 }
 
+class TestClient {
+    runTest() {
+        const server = new DdDbServer().start({
+            port: 3070,
+            host: 'my server',
+            name: 'admin',
+            password: 'aaaa'
+        })
+    }
+}
+
+new TestClient().runTest();
+
 
         // const fileStream = fs.createReadStream('log/file.log');
         // const readLineInstance = readline.createInterface({
@@ -246,3 +341,5 @@ enum ServerStatus {
         //     console.log('Line from file:', line);
         // });
         // readLineInstance.
+
+
