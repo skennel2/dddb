@@ -26,21 +26,31 @@ async function terminalUI() {
     prompt.start();
 
     while (1) {
-        const result = await prompt.get(['key', 'value']);
+        console.log('1. find 2. update')
+        const menu = await prompt.get(['job']);
 
-        if (result.key === 'rrr') {
-            setTimeout(() => {
-                randomAttack()
-            }, 5000);
-            break;
-        } else {
+        if (menu.job === '1') {
+            const result = await prompt.get(['key']);
+
+            sock.emit('find', {
+                key: result.key,
+                type: 'find',
+            }, (response) => {
+                console.log('response: ', response)
+            })
+        } else if (menu.job === '2') {
+            const result = await prompt.get(['key', 'value']);
+
             sock.emit('query', {
                 key: result.key,
                 type: 'add',
                 payload: result.value
             })
+        } else if (menu.job === 'rrr') {
+            setTimeout(() => {
+                randomAttack()
+            }, 5000);
         }
-
     }
 }
 

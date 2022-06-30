@@ -59,6 +59,8 @@ export default class DdDbServer implements IDdDbServer {
     private readonly LOG_ROOT_PATH = 'log/';
     private readonly LOG_FILE_BASE_NAME = 'datalog';
 
+    private fastLookupRecordCache: FastLookUpCache = new FastLookUpCache();
+
     private dataLogFileList: {
         fileName: string,
         version: number,
@@ -128,9 +130,9 @@ export default class DdDbServer implements IDdDbServer {
             await this.flush();
         }, setup.flushInterval !== undefined ? setup.flushInterval : 500);
 
-        setInterval(async () => {
-            this.compactLogFile();
-        }, 50000)
+        // setInterval(async () => {
+        //     await this.compactLogFile();
+        // }, 50000)
 
         this.httpServer.listen(setup.port, () => {
             this.log('listen ' + setup.port)
@@ -151,32 +153,37 @@ export default class DdDbServer implements IDdDbServer {
                     const argsObject = this.parseClientQueryRequestArgument(args);
                     if (argsObject && argsObject.key) {
                         if (argsObject.type === 'add') {
+                            const newItem = {
+                                id: uuidv4(),
+                                status: 'add',
+                                key: argsObject.key,
+                                value: argsObject.payload,
+                                created: new Date(),
+                                clientId: socket.id,
+                                accountId: setup.name
+                            } as IDataLogRecord;
+
                             if (this.dataFlushing === false) {
-                                this.queryLogQueue.push({
-                                    id: uuidv4(),
-                                    status: 'add',
-                                    key: argsObject.key,
-                                    value: argsObject.payload,
-                                    created: new Date(),
-                                    clientId: socket.id,
-                                    accountId: setup.name
-                                })
+                                this.queryLogQueue.push(newItem)
                             } else {
-                                this.subQueryLogQueue.push({
-                                    id: uuidv4(),
-                                    status: 'add',
-                                    key: argsObject.key,
-                                    value: argsObject.payload,
-                                    created: new Date(),
-                                    clientId: socket.id,
-                                    accountId: setup.name
-                                })
+                                this.subQueryLogQueue.push(newItem)
                             }
+
+                            this.fastLookupRecordCache.addItem(newItem.key, newItem);
                         }
                     }
                 } catch (e) {
                     console.error(e);
                     throw e;
+                }
+            })
+
+            socket.on('find', (payload, callback) => {
+                const argsObject = this.parseClientQueryRequestArgument(payload);
+                if (argsObject && argsObject.key) {
+                    this.findByKey(argsObject.key).then((result) => {
+                        callback(result)
+                    })
                 }
             })
 
@@ -192,6 +199,46 @@ export default class DdDbServer implements IDdDbServer {
         })
     }
 
+    findByKey = async (key: string) => {
+        if (this.fastLookupRecordCache.hasItem(key)) {
+            return this.fastLookupRecordCache.getItem(key);
+        }
+
+        for (let index = this.dataLogFileList.length - 1; index >= 0; index--) {
+            const dataLogFile = this.dataLogFileList[index];
+
+            const file = await fsp.readFile(this.LOG_ROOT_PATH + dataLogFile.fileName, 'utf-8');
+            const fileJsons = file
+                .split('\n')
+                .filter(item => item && item.length > 0)
+                .map(item => JSON.parse(item));
+
+            const filtered = fileJsons.filter((item) => {
+                return item.key == key
+            })
+
+            if (filtered.length > 0) {
+                const max = filtered.reduce((a, b) => {
+                    if (b === null || b === undefined) {
+                        return a;
+                    }
+
+                    if (a.created > b.created) {
+                        return a;
+                    }
+
+                    return b;
+                });
+
+                if (max) {
+                    return max;
+                }
+            }
+        }
+
+        return null;
+    }
+
     flush = async () => {
         if (this.dataFlushing === true) {
             return;
@@ -205,8 +252,6 @@ export default class DdDbServer implements IDdDbServer {
 
         this.queryLogQueue = [...this.subQueryLogQueue];
         this.subQueryLogQueue = [];
-
-        console.log(this.dataLogFileList)
     }
 
     private writeDataLogToFileSystem = async (fileBaseName: string, datas: IDataLogRecord[]) => {
@@ -241,8 +286,7 @@ export default class DdDbServer implements IDdDbServer {
             }
             this.dataLogFileList.push(newFileResource);
 
-            await fsp.appendFile(this.RESOURCE_ROOT_PATH + this.FILE_RESOURCE_FILE_NAME, JSON.stringify(newFileResource) + '\n');
-
+            this.writeFileResourceInfoToFileSystem();
             return;
         }
 
@@ -265,11 +309,14 @@ export default class DdDbServer implements IDdDbServer {
             })
 
             this.dataLogFileList.push(nextVersion);
-
-            await fsp.appendFile(this.RESOURCE_ROOT_PATH + this.FILE_RESOURCE_FILE_NAME, JSON.stringify(nextVersion)+ '\n');
+            this.writeFileResourceInfoToFileSystem();
         } else {
             await fsp.appendFile(filePath, result);
         }
+    }
+
+    private writeFileResourceInfoToFileSystem = async () => {
+        await fsp.writeFile(this.RESOURCE_ROOT_PATH + this.FILE_RESOURCE_FILE_NAME, this.dataLogFileList.map(item => JSON.stringify(item)).join('\n'));
     }
 
     private compactLogFile() {
@@ -344,4 +391,33 @@ export default class DdDbServer implements IDdDbServer {
         console.log(data)
     }
 
+}
+
+class FastLookUpCache {
+    private fastLookupRecordCache: Map<string, object> = new Map<string, object>();
+
+    private cachingHitCount: Map<string, number> = new Map<string, number>();
+
+    hasItem = (key: string) => {
+        return this.fastLookupRecordCache.has(key);
+    }
+
+    addItem = (key: string, value: object) => {
+        this.fastLookupRecordCache.set(key, value);
+    }
+
+    getItem = (key: string) => {
+        if (this.fastLookupRecordCache.has(key)) {
+            const resultItem = this.fastLookupRecordCache.get(key) || null;
+
+            if (resultItem) {
+                const count = this.cachingHitCount.get(key) || 0
+                this.cachingHitCount.set(key, count + 1);
+            }
+
+            return resultItem;
+        }
+
+        return null;
+    }
 }
