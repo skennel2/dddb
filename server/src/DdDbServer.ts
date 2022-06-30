@@ -15,7 +15,6 @@ interface IConnectSetup {
     flushInterval?: number,
 }
 
-
 interface IDataLogRecord {
     id: string,
     key: string,
@@ -112,7 +111,7 @@ export default class DdDbServer implements IDdDbServer {
                 throw new Error('file resource not sync data log');
             }
 
-            await this.fsManager.writeFile(fileResourcePathAndName, '');
+            await fsp.writeFile(fileResourcePathAndName, '');
         }
     }
 
@@ -233,7 +232,7 @@ export default class DdDbServer implements IDdDbServer {
 
         const isFileExists = await this.fsManager.isFileExists(filePath);
         if (!isFileExists) {
-            await this.fsManager.writeFile(filePath, result);
+            await fsp.writeFile(filePath, result);
 
             const newFileResource = {
                 fileName: filePath.replace(this.LOG_ROOT_PATH, ''),
@@ -247,7 +246,7 @@ export default class DdDbServer implements IDdDbServer {
             return;
         }
 
-        const fileSize = await this.fsManager.getFileSize(filePath);
+        const fileSize = (await fsp.stat(filePath)).size;
         if (fileSize >= 2000) {
             const nextVersion = {
                 fileName: fileBaseName + (maxVersion.version + 1) + '.log',
@@ -256,7 +255,7 @@ export default class DdDbServer implements IDdDbServer {
             }
 
             filePath = this.LOG_ROOT_PATH + nextVersion.fileName;
-            await this.fsManager.writeFile(filePath, result);
+            await fsp.writeFile(filePath, result);
 
             this.dataLogFileList = this.dataLogFileList.map(item => {
                 return {
@@ -269,7 +268,7 @@ export default class DdDbServer implements IDdDbServer {
 
             await fsp.appendFile(this.RESOURCE_ROOT_PATH + this.FILE_RESOURCE_FILE_NAME, JSON.stringify(nextVersion)+ '\n');
         } else {
-            await this.fsManager.appendFile(filePath, result);
+            await fsp.appendFile(filePath, result);
         }
     }
 
@@ -289,7 +288,7 @@ export default class DdDbServer implements IDdDbServer {
 
                 Promise.all<{ fileName: string, data: string }>(targetFileNames.map((fileName) => {
                     return new Promise(resolve => {
-                        this.fsManager.readFile(this.LOG_ROOT_PATH + fileName).then(fileData => {
+                        fsp.readFile(this.LOG_ROOT_PATH + fileName, 'utf-8').then(fileData => {
                             resolve({
                                 fileName: fileName,
                                 data: fileData
@@ -321,7 +320,7 @@ export default class DdDbServer implements IDdDbServer {
                                 return (a < b ? -1 : (a > b ? 1 : 0));
                             });
 
-                            this.fsManager.writeFile(this.LOG_ROOT_PATH + 'test' + fileDataWithName.fileName, sortedByKey.map(item => JSON.stringify(item)).join('\n'))
+                            fsp.writeFile(this.LOG_ROOT_PATH + 'test' + fileDataWithName.fileName, sortedByKey.map(item => JSON.stringify(item)).join('\n'))
                         })
                 })
 
