@@ -50,6 +50,10 @@ async function terminalUI() {
             setTimeout(() => {
                 randomAttack()
             }, 5000);
+        } else if (menu.job === 'stop') {
+            sock.emit('stop')
+        } else if (menu.job === 'start') {
+            sock.emit('start')
         }
     }
 }
@@ -62,7 +66,7 @@ function randomAttack() {
     let timeout = Math.floor(Math.random() * (15000 - 1500)) + 1500;
     timeout = 10;
 
-    for (let index = 0; index < 4000; index++) {
+    for (let index = 0; index < 40000; index++) {
         setTimeout(() => {
             try {
                 const emited = sock.emit('query', {

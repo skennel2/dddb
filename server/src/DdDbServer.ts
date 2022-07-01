@@ -6,6 +6,9 @@ import * as io from 'socket.io';
 import { DefaultEventsMap } from 'socket.io/dist/typed-events';
 import { v4 as uuidv4 } from 'uuid';
 import FileSystemManager from './FileSystemManager';
+import { BloomFilter } from 'bloom-filters';
+import process from 'node:process';
+import { FastLookUpCache } from './FastLookUpCache';
 
 interface IConnectSetup {
     host: string,
@@ -56,8 +59,13 @@ export default class DdDbServer implements IDdDbServer {
 
     private readonly RESOURCE_ROOT_PATH = 'resource/';
     private readonly FILE_RESOURCE_FILE_NAME = 'file_resource.log';
+    private readonly BLOOM_FILTER_JSON_FILE_NAME = 'bloom.json';
     private readonly LOG_ROOT_PATH = 'log/';
     private readonly LOG_FILE_BASE_NAME = 'datalog';
+
+    private readonly TEXT_ENCODING = 'utf-8';
+
+    private bloomFilter: BloomFilter | null = null;
 
     private fastLookupRecordCache: FastLookUpCache = new FastLookUpCache();
 
@@ -76,18 +84,6 @@ export default class DdDbServer implements IDdDbServer {
         this.fsManager = new FileSystemManager();
     }
 
-    start = (setup: IConnectSetup) => {
-        this.setUp(setup).then(() => {
-            this.processStart(setup)
-        })
-
-        return {
-            getServerStatus: () => {
-                return ServerStatus.RUNNING;
-            }
-        }
-    }
-
     private setUp = async (setup: IConnectSetup) => {
         const dataLogFileNames = (await fsp.readdir(this.LOG_ROOT_PATH))
             .filter(dataLogFileName => this.isDataLogFile(dataLogFileName));
@@ -96,12 +92,7 @@ export default class DdDbServer implements IDdDbServer {
             = this.RESOURCE_ROOT_PATH + this.FILE_RESOURCE_FILE_NAME
 
         if (await this.fsManager.isFileExists(fileResourcePathAndName)) {
-            const fileResourceFile = await fsp.readFile(fileResourcePathAndName, 'utf-8');
-
-            const fileResourceJsonList = fileResourceFile
-                .split('\n')
-                .filter(line => line && line.length > 0)
-                .map(line => JSON.parse(line));
+            const fileResourceJsonList = await this.parselogFile(fileResourcePathAndName)
 
             if (dataLogFileNames.length !== fileResourceJsonList.length) {
                 throw new Error('file resource not sync data log');
@@ -114,6 +105,67 @@ export default class DdDbServer implements IDdDbServer {
             }
 
             await fsp.writeFile(fileResourcePathAndName, '');
+        }
+
+
+        await this.setUpBlooomFilter();
+        this.bindProcessLevelEvent();
+    }
+
+    private setUpBlooomFilter = async () => {
+        const bloomFilterFilePath = this.RESOURCE_ROOT_PATH + this.BLOOM_FILTER_JSON_FILE_NAME;
+        if (await this.fsManager.isFileExists(bloomFilterFilePath) === true) {
+            const bloomJson = await fsp.readFile(bloomFilterFilePath, this.TEXT_ENCODING);
+
+            this.bloomFilter = BloomFilter.fromJSON(JSON.parse(bloomJson));
+        } else {
+            this.bloomFilter = new BloomFilter(1000, 4);
+        }
+    }
+
+    private bindProcessLevelEvent = () => {
+        process.on('exit', (code) => {
+            console.log('Process exit event with code: ', code);
+        });
+
+        process.on("SIGINT", async () => {
+            console.log('SIGINT');
+
+            await this.stop();
+
+            process.exit();
+        });
+    }
+
+    public start = (setup: IConnectSetup) => {
+        this.setUp(setup).then(() => {
+            this.processStart(setup)
+        })
+
+        return {
+            getServerStatus: () => {
+                return ServerStatus.RUNNING;
+            }
+        }
+    }
+
+    public stop = async () => {
+        if (this.bloomFilter) {
+            const bloomJson = this.bloomFilter.saveAsJSON();
+            const bloomResouceFilePath = this.RESOURCE_ROOT_PATH + this.BLOOM_FILTER_JSON_FILE_NAME;
+            await fsp.writeFile(bloomResouceFilePath, JSON.stringify(bloomJson));
+        }
+
+        if (this.dataFlushing === true) {
+            const timer = setInterval(() => {
+                if (this.dataFlushing === false) {
+                    clearInterval(timer)
+                    process.exit();
+                }
+            }, 500)
+        } else {
+            await this.flush();
+            process.exit();
         }
     }
 
@@ -147,8 +199,7 @@ export default class DdDbServer implements IDdDbServer {
                 type: "connected"
             })
 
-            socket.on('query', (args) => {
-                this.log('request -> ' + args)
+            socket.on('query', (args, callback) => {
                 try {
                     const argsObject = this.parseClientQueryRequestArgument(args);
                     if (argsObject && argsObject.key) {
@@ -170,21 +221,45 @@ export default class DdDbServer implements IDdDbServer {
                             }
 
                             this.fastLookupRecordCache.addItem(newItem.key, newItem);
+                            if (this.bloomFilter) {
+                                this.bloomFilter.add(argsObject.key);
+                            }
                         }
                     }
                 } catch (e) {
+                    if (callback) {
+                        callback(e)
+                    }
                     console.error(e);
-                    throw e;
                 }
             })
 
             socket.on('find', (payload, callback) => {
-                const argsObject = this.parseClientQueryRequestArgument(payload);
-                if (argsObject && argsObject.key) {
-                    this.findByKey(argsObject.key).then((result) => {
-                        callback(result)
-                    })
+                try {
+                    const argsObject = this.parseClientQueryRequestArgument(payload);
+                    if (argsObject && argsObject.key) {
+                        if (this.bloomFilter) {
+                            if (this.bloomFilter.has(argsObject.key) === false) {
+                                callback(null);
+                                return;
+                            }
+                        }
+
+                        this.findByKey(argsObject.key).then((result) => {
+                            callback(result)
+                        })
+                    }
+                } catch (e) {
+                    if (callback) {
+                        callback(e);
+                    }
+
+                    console.error(e)
                 }
+            })
+
+            socket.on('stop', () => {
+                this.stop();
             })
 
             socket.on('disconnect', () => {
@@ -207,18 +282,14 @@ export default class DdDbServer implements IDdDbServer {
         for (let index = this.dataLogFileList.length - 1; index >= 0; index--) {
             const dataLogFile = this.dataLogFileList[index];
 
-            const file = await fsp.readFile(this.LOG_ROOT_PATH + dataLogFile.fileName, 'utf-8');
-            const fileJsons = file
-                .split('\n')
-                .filter(item => item && item.length > 0)
-                .map(item => JSON.parse(item));
+            const fileJsons = await this.parselogFile(this.LOG_ROOT_PATH + dataLogFile.fileName);
 
             const filtered = fileJsons.filter((item) => {
                 return item.key == key
             })
 
             if (filtered.length > 0) {
-                const max = filtered.reduce((a, b) => {
+                const moreCurrentItem = filtered.reduce((a, b) => {
                     if (b === null || b === undefined) {
                         return a;
                     }
@@ -230,13 +301,23 @@ export default class DdDbServer implements IDdDbServer {
                     return b;
                 });
 
-                if (max) {
-                    return max;
+                if (moreCurrentItem) {
+                    return moreCurrentItem;
                 }
             }
         }
 
         return null;
+    }
+
+    parselogFile = async (filePath: string) => {
+        const file = await fsp.readFile(filePath, this.TEXT_ENCODING);
+        const fileJsons = file
+            .split('\n')
+            .filter(item => item && item.length > 0)
+            .map(item => JSON.parse(item));
+
+        return fileJsons;
     }
 
     flush = async () => {
@@ -335,7 +416,7 @@ export default class DdDbServer implements IDdDbServer {
 
                 Promise.all<{ fileName: string, data: string }>(targetFileNames.map((fileName) => {
                     return new Promise(resolve => {
-                        fsp.readFile(this.LOG_ROOT_PATH + fileName, 'utf-8').then(fileData => {
+                        fsp.readFile(this.LOG_ROOT_PATH + fileName, this.TEXT_ENCODING).then(fileData => {
                             resolve({
                                 fileName: fileName,
                                 data: fileData
@@ -389,35 +470,5 @@ export default class DdDbServer implements IDdDbServer {
 
     log(...data: any[]) {
         console.log(data)
-    }
-
-}
-
-class FastLookUpCache {
-    private fastLookupRecordCache: Map<string, object> = new Map<string, object>();
-
-    private cachingHitCount: Map<string, number> = new Map<string, number>();
-
-    hasItem = (key: string) => {
-        return this.fastLookupRecordCache.has(key);
-    }
-
-    addItem = (key: string, value: object) => {
-        this.fastLookupRecordCache.set(key, value);
-    }
-
-    getItem = (key: string) => {
-        if (this.fastLookupRecordCache.has(key)) {
-            const resultItem = this.fastLookupRecordCache.get(key) || null;
-
-            if (resultItem) {
-                const count = this.cachingHitCount.get(key) || 0
-                this.cachingHitCount.set(key, count + 1);
-            }
-
-            return resultItem;
-        }
-
-        return null;
     }
 }
